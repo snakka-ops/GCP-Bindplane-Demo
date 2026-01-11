@@ -1,0 +1,141 @@
+name: BindPlane GCP Demo Deployment (Strict Active Gates)
+
+on:
+  workflow_dispatch:
+
+env:
+  TF_VERSION: 1.6.6
+  TF_VAR_project_id: ${{ secrets.GCP_PROJECT_ID }}
+  TF_VAR_region: ${{ secrets.GCP_REGION }}
+  TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
+  TF_VAR_admin_password: ${{ secrets.BINDPLANE_ADMIN_PASSWORD }}
+
+# =========================================================
+# PART 1 – DATABASE (ACTIVE CHECK)
+# =========================================================
+jobs:
+  part1-db:
+    name: Part 1 – PostgreSQL (Wait Until ACTIVE)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Deploy PostgreSQL
+        working-directory: terraform/part1-db
+        run: |
+          terraform init
+          terraform apply -auto-approve
+
+      - name: Wait until PostgreSQL is ACTIVE
+        working-directory: terraform/part1-db
+        run: |
+          DB_IP=$(terraform output -raw db_ip)
+          echo "Checking PostgreSQL status on $DB_IP:5432"
+
+          for i in {1..30}; do
+            if nc -z $DB_IP 5432; then
+              echo " PostgreSQL is ACTIVE"
+              exit 0
+            fi
+            echo "PostgreSQL not active yet..."
+            sleep 10
+          done
+
+          echo "PostgreSQL did not become ACTIVE"
+          exit 1
+
+# =========================================================
+# PART 2 – CONTROL PLANE (ACTIVE CHECK)
+# =========================================================
+  part2-control-plane:
+    name: Part 2 – BindPlane Control Plane (Wait Until ACTIVE)
+    runs-on: ubuntu-latest
+    needs: part1-db
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Deploy Control Plane
+        working-directory: terraform/part2-control-plane
+        run: |
+          terraform init
+          terraform apply -auto-approve
+
+      - name: Wait until Control Plane is ACTIVE
+        working-directory: terraform/part2-control-plane
+        run: |
+          CP_IP=$(terraform output -raw control_plane_ip)
+          echo "Checking BindPlane UI on http://$CP_IP:3001"
+
+          for i in {1..30}; do
+            if curl -sf http://$CP_IP:3001 >/dev/null; then
+              echo " Control Plane is ACTIVE"
+              exit 0
+            fi
+            echo " Control Plane not active yet..."
+            sleep 10
+          done
+
+          echo " Control Plane did not become ACTIVE"
+          exit 1
+
+# =========================================================
+# PART 3 – AGENT (ACTIVE CHECK)
+# =========================================================
+  part3-agents:
+    name: Part 3 – BindPlane Agent (Wait Until ACTIVE)
+    runs-on: ubuntu-latest
+    needs: part2-control-plane
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Deploy Agent
+        working-directory: terraform/part3-agents
+        run: |
+          terraform init
+          terraform apply -auto-approve
+
+      - name: Wait until Agent is ACTIVE
+        working-directory: terraform/part2-control-plane
+        run: |
+          CP_IP=$(terraform output -raw control_plane_ip)
+          echo "Checking agent registration"
+
+          for i in {1..30}; do
+            COUNT=$(curl -sf http://$CP_IP:3001/api/v1/agents | jq '.agents | length')
+            if [ "$COUNT" -ge 1 ]; then
+              echo "Agent is ACTIVE and registered"
+              exit 0
+            fi
+            echo " Agent not active yet..."
+            sleep 10
+          done
+
+          echo " Agent did not become ACTIVE"
+          exit 1
